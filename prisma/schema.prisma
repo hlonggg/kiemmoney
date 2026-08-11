@@ -1,0 +1,263 @@
+// ============================================================
+// LINKEARN PLATFORM — DATABASE SCHEMA
+// Hệ thống: kiếm tiền qua hoàn thành nhiệm vụ vượt link rút gọn
+// DB: PostgreSQL (production) — đổi provider sang "sqlite" nếu chỉ test local
+// ============================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ------------------- NGƯỜI DÙNG -------------------
+
+model User {
+  id              String   @id @default(cuid())
+  email           String   @unique
+  phone           String?  @unique
+  username        String   @unique
+  passwordHash    String
+  fullName        String?
+  avatarUrl       String?
+  role            Role     @default(USER)
+  status          UserStatus @default(ACTIVE)
+
+  balance         Decimal  @default(0) @db.Decimal(14, 2) // số dư khả dụng (VND)
+  pendingBalance  Decimal  @default(0) @db.Decimal(14, 2) // đang chờ duyệt rút
+  totalEarned     Decimal  @default(0) @db.Decimal(14, 2) // tổng đã kiếm được (lifetime)
+
+  referralCode    String   @unique
+  referredById    String?
+  referredBy      User?    @relation("Referrals", fields: [referredById], references: [id])
+  referrals       User[]   @relation("Referrals")
+
+  emailVerifiedAt DateTime?
+  lastLoginAt     DateTime?
+  lastLoginIp     String?
+  registerIp      String?
+
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  taskCompletions TaskCompletion[]
+  withdrawals     Withdrawal[]
+  transactions    Transaction[]
+  supportTickets  SupportTicket[]
+  ticketMessages  TicketMessage[]
+  refreshTokens   RefreshToken[]
+  referralEarnings ReferralEarning[] @relation("Beneficiary")
+
+  @@index([referredById])
+  @@index([status])
+}
+
+enum Role {
+  USER
+  MODERATOR
+  ADMIN
+}
+
+enum UserStatus {
+  ACTIVE
+  SUSPENDED   // khóa do vi phạm / nghi gian lận
+  BANNED
+  PENDING     // chờ xác minh email
+}
+
+model RefreshToken {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tokenHash String   @unique
+  userAgent String?
+  ip        String?
+  expiresAt DateTime
+  revokedAt DateTime?
+  createdAt DateTime @default(now())
+
+  @@index([userId])
+}
+
+// ------------------- NHIỆM VỤ (VƯỢT LINK) -------------------
+
+model Task {
+  id            String     @id @default(cuid())
+  title         String
+  description   String?
+  destinationUrl String    // URL gốc cần vượt qua để hoàn thành
+  shortenerProvider String  // vd: "yeumoney", "internal", ...
+  rewardAmount  Decimal    @db.Decimal(10, 2) // VND mỗi lượt hoàn thành
+  dailyLimitPerUser Int    @default(1) // số lần 1 user được làm nhiệm vụ này / ngày
+  totalSlots    Int?       // null = không giới hạn tổng lượt
+  completedSlots Int       @default(0)
+  status        TaskStatus @default(ACTIVE)
+  minAccountAgeHours Int   @default(0) // chống bot: tài khoản phải đủ tuổi mới làm được
+  startAt       DateTime   @default(now())
+  endAt         DateTime?
+  createdAt     DateTime   @default(now())
+  updatedAt     DateTime   @updatedAt
+
+  completions   TaskCompletion[]
+
+  @@index([status])
+}
+
+enum TaskStatus {
+  ACTIVE
+  PAUSED
+  ENDED
+}
+
+model TaskCompletion {
+  id           String   @id @default(cuid())
+  taskId       String
+  task         Task     @relation(fields: [taskId], references: [id])
+  userId       String
+  user         User     @relation(fields: [userId], references: [id])
+
+  sessionToken String   @unique // token phát khi user bắt đầu nhiệm vụ, dùng để xác thực callback
+  status       CompletionStatus @default(STARTED)
+  rewardAmount Decimal  @db.Decimal(10, 2)
+
+  ip           String
+  userAgent    String?
+  deviceFingerprint String?
+
+  startedAt    DateTime @default(now())
+  verifiedAt   DateTime?
+  rejectedReason String?
+
+  @@index([userId, taskId])
+  @@index([sessionToken])
+}
+
+enum CompletionStatus {
+  STARTED    // user vừa bấm bắt đầu, chưa xác nhận
+  VERIFIED   // đã xác nhận hoàn thành hợp lệ, đã cộng tiền
+  REJECTED   // phát hiện gian lận / trùng IP-device / bot
+  EXPIRED    // quá thời gian mà không xác nhận
+}
+
+// ------------------- HỆ THỐNG GIỚI THIỆU (MỜI BẠN BÈ) -------------------
+
+model ReferralEarning {
+  id             String   @id @default(cuid())
+  beneficiaryId  String   // người được cộng hoa hồng (người mời)
+  beneficiary    User     @relation("Beneficiary", fields: [beneficiaryId], references: [id])
+  sourceUserId   String   // người được mời, tạo ra hoa hồng
+  level          Int      // 1 = mời trực tiếp, 2 = tuyến dưới của tuyến dưới (nếu áp dụng)
+  taskCompletionId String?
+  amount         Decimal  @db.Decimal(10, 2)
+  createdAt      DateTime @default(now())
+
+  @@index([beneficiaryId])
+}
+
+// ------------------- GIAO DỊCH (SỔ CÁI) -------------------
+
+model Transaction {
+  id          String   @id @default(cuid())
+  userId      String
+  user        User     @relation(fields: [userId], references: [id])
+  type        TransactionType
+  amount      Decimal  @db.Decimal(14, 2) // dương = cộng, âm = trừ
+  balanceAfter Decimal @db.Decimal(14, 2)
+  refType     String?  // "task_completion" | "withdrawal" | "referral" | "admin_adjust"
+  refId       String?
+  note        String?
+  createdAt   DateTime @default(now())
+
+  @@index([userId, createdAt])
+}
+
+enum TransactionType {
+  TASK_REWARD
+  REFERRAL_BONUS
+  WITHDRAWAL
+  WITHDRAWAL_REFUND
+  ADMIN_ADJUSTMENT
+}
+
+// ------------------- RÚT TIỀN -------------------
+
+model Withdrawal {
+  id            String   @id @default(cuid())
+  userId        String
+  user          User     @relation(fields: [userId], references: [id])
+  amount        Decimal  @db.Decimal(14, 2)
+  method        WithdrawMethod
+  destination   String   // số tài khoản / số momo / ví...
+  destinationName String? // tên chủ tài khoản
+  status        WithdrawStatus @default(PENDING)
+  adminNote     String?
+  processedById String?
+  requestedAt   DateTime @default(now())
+  processedAt   DateTime?
+
+  @@index([userId, status])
+  @@index([status])
+}
+
+enum WithdrawMethod {
+  BANK_TRANSFER
+  MOMO
+  ZALOPAY
+  USDT_TRC20
+}
+
+enum WithdrawStatus {
+  PENDING
+  APPROVED
+  PROCESSING
+  COMPLETED
+  REJECTED
+}
+
+// ------------------- HỖ TRỢ (SUPPORT TICKET) -------------------
+
+model SupportTicket {
+  id          String   @id @default(cuid())
+  userId      String
+  user        User     @relation(fields: [userId], references: [id])
+  subject     String
+  category    TicketCategory
+  status      TicketStatus @default(OPEN)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  messages    TicketMessage[]
+
+  @@index([userId])
+  @@index([status])
+}
+
+enum TicketCategory {
+  WITHDRAW_ISSUE
+  TASK_ISSUE
+  ACCOUNT_ISSUE
+  OTHER
+}
+
+enum TicketStatus {
+  OPEN
+  IN_PROGRESS
+  RESOLVED
+  CLOSED
+}
+
+model TicketMessage {
+  id        String   @id @default(cuid())
+  ticketId  String
+  ticket    SupportTicket @relation(fields: [ticketId], references: [id])
+  authorId  String
+  author    User     @relation(fields: [authorId], references: [id])
+  isStaff   Boolean  @default(false)
+  body      String
+  createdAt DateTime @default(now())
+
+  @@index([ticketId])
+}
